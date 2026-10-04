@@ -215,13 +215,17 @@ const SANDBOX_ENV_ALLOW: &[&str] = &[
     "TERM",
     // Windows processes (cmd, and the cygwin/git-bash and MSYS runtimes) need
     // the system location keys to find system DLLs, `cmd.exe` itself, and run
-    // `.bat`/`.cmd` helpers. Harmless no-ops on unix, where none are set.
+    // `.bat`/`.cmd` helpers. `LOCALAPPDATA` is not optional either: building
+    // the AppContainer child's environment fails without it
+    // (`ERROR_ENVVAR_NOT_FOUND`, 203) before the shell ever starts. Harmless
+    // no-ops on unix, where none are set.
     "SystemRoot",
     "windir",
     "ComSpec",
     "PATHEXT",
     "ProgramFiles",
     "ProgramData",
+    "LOCALAPPDATA",
 ];
 
 /// Every spelling of "where temporary files go": POSIX tools read `TMPDIR`,
@@ -695,6 +699,18 @@ mod env_allowlist_tests {
             );
         }
     }
+
+    /// `LOCALAPPDATA` must ride along too: Windows resolves it while building
+    /// the AppContainer child's environment, so a filtered block that lacks it
+    /// makes `CreateProcessW` fail with `ERROR_ENVVAR_NOT_FOUND` (203) before
+    /// the shell starts.
+    #[test]
+    fn allowlist_has_localappdata() {
+        assert!(
+            SANDBOX_ENV_ALLOW.contains(&"LOCALAPPDATA"),
+            "missing LOCALAPPDATA in SANDBOX_ENV_ALLOW"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -754,6 +770,30 @@ mod tests {
             format!("{s} {s} {s}")
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The allowlist is what carries `LOCALAPPDATA` into the shell's
+    /// environment -- the same passthrough the AppContainer helper's
+    /// environment block is built from. A host value must reach the command.
+    #[tokio::test]
+    async fn localappdata_passes_through_to_the_shell() {
+        let sentinel = "jan-localappdata-sentinel";
+        std::env::set_var("LOCALAPPDATA", sentinel);
+        let child = spawn(
+            shell(),
+            "echo $LOCALAPPDATA",
+            &tmp(),
+            None,
+            ShellEnv::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let pid = child.id().unwrap();
+        let out = child.wait_with_output().await.unwrap();
+        unregister(None, pid);
+        std::env::remove_var("LOCALAPPDATA");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), sentinel);
     }
 
     /// With no scratch the shell keeps whatever the host allowlist passed
