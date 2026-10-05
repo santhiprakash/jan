@@ -104,6 +104,7 @@ vi.mock('@janhq/core', () => ({
   AppEvent: {
     onModelImported: 'onModelImported',
     onBackendVerificationFailed: 'onBackendVerificationFailed',
+    onEngineBackendFallback: 'onEngineBackendFallback',
   },
   DownloadEvent: {
     onFileDownloadUpdate: 'onFileDownloadUpdate',

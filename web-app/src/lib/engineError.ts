@@ -11,6 +11,7 @@ export const ENGINE_ERROR_CODES = [
   'MODEL_LOAD_TIMED_OUT',
   'MISSING_SHARED_LIBRARY',
   'GPU_DRIVER_TOO_OLD',
+  'GPU_ARCH_NOT_SUPPORTED',
   'OUT_OF_MEMORY',
   'INVALID_ARGUMENT',
   'IO_ERROR',
@@ -100,6 +101,14 @@ export function parseEngineError(
   } catch {
     return undefined
   }
+}
+
+/**
+ * The worker's fault events carry the raw log line, not a structured error, so
+ * the same CUDA marker the Rust classifier keys on has to be matched here.
+ */
+export function isGpuArchUnsupportedError(text: string | undefined): boolean {
+  return !!text && /no kernel image is available/i.test(text)
 }
 
 /** Enough of the engine's output to name a cause, short enough for a toast. */

@@ -1,5 +1,8 @@
 import { useEffect } from 'react'
 import { listen } from '@tauri-apps/api/event'
+import { toast } from 'sonner'
+import { events, AppEvent } from '@janhq/core'
+import { useTranslation } from '@/i18n/react-i18next-compat'
 
 import { useAppState } from '@/hooks/useAppState'
 import { useCoworkRun } from '@/hooks/useCoworkRun'
@@ -23,6 +26,7 @@ type UnloadEventPayload = {
 }
 
 export default function LlamacppOomListener() {
+  const { t } = useTranslation()
   useEffect(() => {
     if (!isPlatformTauri()) return
     const unlistenOom = listen<string>('llamacpp-router-oom', (event) => {
@@ -84,13 +88,20 @@ export default function LlamacppOomListener() {
       console.warn('listen llamacpp-model-unloaded failed:', e)
       return () => {}
     })
+    // Extension-side, not a Tauri event: the engine restart already happened by
+    // the time this lands, so it is a notice rather than an error state.
+    const onBackendFallback = () => {
+      toast(t('model-errors:engineBackendFallback'))
+    }
+    events.on(AppEvent.onEngineBackendFallback, onBackendFallback)
     return () => {
       void unlistenOom.then((fn) => fn?.())
       void unlistenBackend.then((fn) => fn?.())
       void unlistenLoadProgress.then((fn) => fn?.())
       void unlistenUnloaded.then((fn) => fn?.())
+      events.off(AppEvent.onEngineBackendFallback, onBackendFallback)
     }
-  }, [])
+  }, [t])
 
   return null
 }

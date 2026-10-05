@@ -65,6 +65,7 @@ const DYNAMIC_KEYS: Record<string, string[]> = {
     'engine.MODEL_LOAD_TIMED_OUT',
     'engine.MISSING_SHARED_LIBRARY',
     'engine.GPU_DRIVER_TOO_OLD',
+    'engine.GPU_ARCH_NOT_SUPPORTED',
     'engine.OUT_OF_MEMORY',
     'engine.INVALID_ARGUMENT',
     'engine.IO_ERROR',

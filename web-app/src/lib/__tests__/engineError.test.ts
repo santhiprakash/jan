@@ -14,6 +14,7 @@ import {
   parseEngineError,
   describeEngineError,
   engineFailure,
+  isGpuArchUnsupportedError,
   ENGINE_ERROR_CODES,
 } from '../engineError'
 
@@ -55,6 +56,16 @@ describe('parseEngineError', () => {
     const parsed = parseEngineError(new Error(`Failed to start model: ${inner}`))
 
     expect(parsed?.code).toBe('OUT_OF_MEMORY')
+  })
+
+  it('reads the GPU architecture code from a Tauri-serialized error', () => {
+    const parsed = parseEngineError({
+      code: 'GPU_ARCH_NOT_SUPPORTED',
+      details:
+        'CUDA error: no kernel image is available for execution on the device',
+    })
+
+    expect(parsed?.code).toBe('GPU_ARCH_NOT_SUPPORTED')
   })
 
   it('tolerates a non-array missing_libraries', () => {
@@ -196,5 +207,34 @@ describe('engineFailure', () => {
     )
 
     expect(wrapped.message).toContain('GPU fail')
+  })
+})
+
+describe('isGpuArchUnsupportedError', () => {
+  // The fault event carries the worker's raw stderr line, so the banner can
+  // only match on the CUDA runtime's own wording.
+  it('matches the CUDA no-kernel-image line', () => {
+    expect(
+      isGpuArchUnsupportedError(
+        'CUDA error: no kernel image is available for execution on the device'
+      )
+    ).toBe(true)
+    expect(
+      isGpuArchUnsupportedError(
+        'ggml-cuda.cu:104: CUDA error: no kernel image is available'
+      )
+    ).toBe(true)
+  })
+
+  it('does not match other backend faults or empty input', () => {
+    for (const line of [
+      'CUDA error: out of memory',
+      'ggml_vulkan: device lost',
+      'GGML_ASSERT: assertion failed',
+      '',
+      undefined,
+    ]) {
+      expect(isGpuArchUnsupportedError(line)).toBe(false)
+    }
   })
 })

@@ -9,6 +9,7 @@ pub enum ErrorCode {
     ModelLoadTimedOut,
     MissingSharedLibrary,
     GpuDriverTooOld,
+    GpuArchNotSupported,
 
     // --- Memory Errors ---
     OutOfMemory,
@@ -98,6 +99,19 @@ impl LlamacppError {
             ));
         }
 
+        // The kernel list is compiled into the backend, so a GPU older than
+        // the compiled set loads the driver fine and then dies on the first
+        // kernel launch. Distinct from the driver check above: no update
+        // fixes it, but the paired Vulkan build or a CUDA build that still
+        // carries the architecture does.
+        if is_arch_not_supported(&lower) {
+            return Some(Self::new(
+                ErrorCode::GpuArchNotSupported,
+                "This GPU's architecture is not supported by the bundled CUDA backend.".into(),
+                Some(output.into()),
+            ));
+        }
+
         if lower.contains("error loading model architecture") {
             return Some(Self::new(
                 ErrorCode::ModelArchNotSupported,
@@ -138,6 +152,13 @@ fn is_driver_too_old(lower: &str) -> bool {
     DRIVER_TOO_OLD_MARKERS
         .iter()
         .any(|m| lower.contains(m))
+}
+
+/// CUDA's `cudaErrorNoKernelImageForDevice` text. ggml reports it as a plain
+/// `CUDA error:` line, so there is no structured field to match -- the phrase
+/// itself is the contract, and it does not overlap the OOM or loader markers.
+fn is_arch_not_supported(lower: &str) -> bool {
+    lower.contains("no kernel image is available")
 }
 
 fn looks_like_library(name: &str) -> bool {
@@ -254,6 +275,7 @@ mod tests {
             (ErrorCode::ModelLoadTimedOut, "MODEL_LOAD_TIMED_OUT"),
             (ErrorCode::MissingSharedLibrary, "MISSING_SHARED_LIBRARY"),
             (ErrorCode::GpuDriverTooOld, "GPU_DRIVER_TOO_OLD"),
+            (ErrorCode::GpuArchNotSupported, "GPU_ARCH_NOT_SUPPORTED"),
             (ErrorCode::OutOfMemory, "OUT_OF_MEMORY"),
             (ErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
             (ErrorCode::IoError, "IO_ERROR"),
@@ -365,6 +387,34 @@ mod tests {
             let err = classify(stderr);
             assert!(matches!(err.code, ErrorCode::GpuDriverTooOld), "{stderr} -> {err:?}");
         }
+    }
+
+    // jan#9091: a CUDA 13 build selected for a Pascal (sm_61) GPU dies at the
+    // first kernel launch. Without this arm it surfaces as an unclassified
+    // load failure instead of the arch mismatch it is.
+    #[test]
+    fn classifies_a_cuda_no_kernel_image_error() {
+        for stderr in [
+            "CUDA error: no kernel image is available for execution on the device",
+            "ggml-cuda.cu:104: CUDA error: no kernel image is available for execution on the device\n  current device: 0, in function ggml_cuda_mul_mat",
+            "load_model: error: cuda error: no kernel image is available for execution on the device",
+        ] {
+            let err = classify(stderr);
+            assert!(
+                matches!(err.code, ErrorCode::GpuArchNotSupported),
+                "{stderr} -> {err:?}"
+            );
+            assert_eq!(err.details.as_deref(), Some(stderr));
+        }
+    }
+
+    #[test]
+    fn an_unrelated_cuda_error_is_not_an_arch_mismatch() {
+        let err = classify("CUDA error: out of memory while allocating buffer");
+        assert!(matches!(err.code, ErrorCode::OutOfMemory), "{err:?}");
+
+        let err = classify("CUDA error: an illegal memory access was encountered");
+        assert!(matches!(err.code, ErrorCode::ModelLoadFailed), "{err:?}");
     }
 
     #[test]

@@ -1304,6 +1304,124 @@ describe('reportMissingLibrariesFromError', () => {
   })
 })
 
+describe('vulkan fallback for an unsupported CUDA arch', () => {
+  let extension: llamacpp_extension
+
+  const expectedSession = {
+    model_id: 'test-model',
+    pid: 123,
+    port: 3000,
+    api_key: 'test-api-key',
+  }
+
+  // jan#9091: the shape the plugin emits for a GPU older than the bundled CUDA
+  // build's kernel list (e.g. Pascal under a CUDA 13 build).
+  const archError = () => ({
+    code: 'GPU_ARCH_NOT_SUPPORTED',
+    message: "This GPU's architecture is not supported by the bundled CUDA backend.",
+    details:
+      'CUDA error: no kernel image is available for execution on the device',
+  })
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    extension = new llamacpp_extension()
+    extension['providerPath'] = '/path/to/jan/llamacpp'
+    extension['config'] = {} as never
+    extension['userModelsMax'] = 0
+
+    const { getJanDataFolderPath, joinPath, fs } = await import('@janhq/core')
+    vi.mocked(getJanDataFolderPath).mockResolvedValue('/path/to/jan')
+    vi.mocked(joinPath).mockImplementation((paths: string[]) =>
+      Promise.resolve(paths.join('/'))
+    )
+    vi.mocked(fs.existsSync).mockResolvedValue(true)
+    vi.mocked(fs.readdirSync).mockResolvedValue([] as never)
+    vi.mocked(getBackendSetting).mockResolvedValue('true' as never)
+
+    vi.mocked(generatePreset).mockResolvedValue({
+      path: '/preset.ini',
+      embeddingCount: 0,
+    } as never)
+
+    const api = await import('@janhq/tauri-plugin-llamacpp-api')
+    const engineInfo = {
+      port: 39271,
+      api_key: 'k',
+      pid: 1234,
+      models: [],
+    }
+    vi.mocked(api.startEngine).mockResolvedValue(engineInfo as never)
+    vi.mocked(api.getEngineInfo).mockResolvedValue(engineInfo as never)
+    // mockReset also drains queued mockResolvedValueOnce/mockedRejectedValueOnce
+    // entries, which clearAllMocks leaves behind for the next test.
+    vi.mocked(api.loadLlamaModel)
+      .mockReset()
+      .mockResolvedValue(expectedSession as never)
+
+    const { invoke } = await import('@tauri-apps/api/core')
+    vi.mocked(invoke).mockImplementation(async (cmd: string) =>
+      cmd === 'plugin:llamacpp|find_session_by_model' ? null : undefined
+    )
+  })
+
+  it('hides CUDA, restarts on Vulkan, and retries the load', async () => {
+    const api = await import('@janhq/tauri-plugin-llamacpp-api')
+    vi.mocked(api.engineDevices).mockResolvedValue([
+      { id: 'CUDA0', name: 'NVIDIA GeForce GTX 1080', mem: 8192, free: 7185 },
+      { id: 'Vulkan0', name: 'NVIDIA GeForce GTX 1080', mem: 8192, free: 7185 },
+    ])
+    vi.mocked(api.loadLlamaModel)
+      .mockRejectedValueOnce(archError())
+      .mockResolvedValueOnce(expectedSession as never)
+
+    const result = await extension.load('test-model')
+
+    expect(result).toEqual(expectedSession)
+    expect(api.stopEngine).toHaveBeenCalledTimes(1)
+
+    // One start for provisioning, then the fallback restart with CUDA hidden.
+    const starts = vi.mocked(api.startEngine).mock.calls
+    expect(starts).toHaveLength(2)
+    expect(starts[0][3]).not.toHaveProperty('CUDA_VISIBLE_DEVICES')
+    expect(starts[1][3]).toMatchObject({ CUDA_VISIBLE_DEVICES: '' })
+
+    const { events } = await import('@janhq/core')
+    expect(vi.mocked(events.emit)).toHaveBeenCalledWith(
+      'onEngineBackendFallback',
+      { from: 'cuda', to: 'vulkan' }
+    )
+  })
+
+  it('surfaces the arch error unchanged when no Vulkan device exists', async () => {
+    const api = await import('@janhq/tauri-plugin-llamacpp-api')
+    vi.mocked(api.engineDevices).mockResolvedValue([
+      { id: 'CUDA0', name: 'NVIDIA GeForce GTX 1080', mem: 8192, free: 7185 },
+    ])
+    vi.mocked(api.loadLlamaModel).mockRejectedValue(archError())
+
+    await expect(extension.load('test-model')).rejects.toEqual(
+      expect.objectContaining({ code: 'GPU_ARCH_NOT_SUPPORTED' })
+    )
+    expect(api.stopEngine).not.toHaveBeenCalled()
+    expect(api.startEngine).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not restart the engine for an unrelated load failure', async () => {
+    const api = await import('@janhq/tauri-plugin-llamacpp-api')
+    vi.mocked(api.loadLlamaModel).mockRejectedValue({
+      code: 'MODEL_LOAD_FAILED',
+      message: 'boom',
+    })
+
+    await expect(extension.load('test-model')).rejects.toEqual(
+      expect.objectContaining({ code: 'MODEL_LOAD_FAILED' })
+    )
+    expect(api.engineDevices).not.toHaveBeenCalled()
+    expect(api.stopEngine).not.toHaveBeenCalled()
+  })
+})
+
 describe('createDownloadTaskId', () => {
   let extension: llamacpp_extension
 

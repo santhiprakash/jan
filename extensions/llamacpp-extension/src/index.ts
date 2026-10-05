@@ -75,6 +75,7 @@ import {
   isModelSupported,
   unloadLlamaModel,
   startEngine,
+  stopEngine,
   eraseThreadSlotState,
   getEngineInfo as pluginGetEngineInfo,
   getEngineVersion as pluginGetEngineVersion,
@@ -446,6 +447,17 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
   private userModelsMax: number = 1
   private engineEmbeddingBonus: number = 0
   private loadedChatOrder: string[] = []
+
+  /**
+   * Session flag: the bundled CUDA backend reported `no kernel image` for the
+   * detected GPU, so the worker is respawned with CUDA devices hidden and the
+   * paired Vulkan backend drives the GPU instead. Session-only on purpose --
+   * an engine or driver update that restores support just works, where a
+   * persisted override would outlive its cause.
+   */
+  private cudaHidden = false
+  /** Concurrent failed loads share one restart rather than racing it. */
+  private vulkanFallback?: Promise<boolean>
 
   // The engine worker spawn runs off the onLoad critical path; awaited via
   // ensureEngineReady() before any model load so inference never races it.
@@ -883,6 +895,9 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
     // parent; it does not, it gets reparented.
     const envs: Record<string, string> = {}
     envs['LLAMA_ARG_TIMEOUT'] = String(this.timeout)
+    // Hiding CUDA devices is what makes ggml fall through to the paired Vulkan
+    // backend; an explicit llamacpp_env entry still wins over the fallback.
+    if (this.cudaHidden) envs['CUDA_VISIBLE_DEVICES'] = ''
     if (this.llamacpp_env) this.parseEnvFromString(envs, this.llamacpp_env)
 
     const info = await startEngine(
@@ -2297,17 +2312,84 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
       await this.evictChatIfAtCapacity(modelId)
     }
 
-    try {
+    const loadOnce = async (): Promise<SessionInfo> => {
       const info = await loadLlamaModel(modelId, isEmbedding)
       if (!isEmbedding) {
         this.loadedChatOrder = this.loadedChatOrder.filter((m) => m !== modelId)
         this.loadedChatOrder.push(modelId)
       }
       return info
-    } catch (error) {
-      logger.error('Error in load command:\n', error)
-      throw error
     }
+
+    try {
+      return await loadOnce()
+    } catch (error) {
+      if (!(await this.tryVulkanFallback(error))) {
+        logger.error('Error in load command:\n', error)
+        throw error
+      }
+      try {
+        return await loadOnce()
+      } catch (retryError) {
+        logger.error('Error in load command after the Vulkan fallback:\n', retryError)
+        throw retryError
+      }
+    }
+  }
+
+  /**
+   * A CUDA build's kernel list is fixed at compile time, so a GPU older than
+   * the compiled set dies on the first launch with `no kernel image`. Every
+   * shipping GPU variant pairs Vulkan for exactly this case, and hiding CUDA
+   * devices (CUDA_VISIBLE_DEVICES) is what makes ggml fall through to it.
+   *
+   * True only once the engine is actually back up on Vulkan -- a `false` means
+   * the original error is the honest one to show.
+   */
+  private tryVulkanFallback(error: unknown): Promise<boolean> {
+    const code = (error as { code?: unknown } | undefined)?.code
+    if (this.cudaHidden || code !== 'GPU_ARCH_NOT_SUPPORTED') {
+      return Promise.resolve(false)
+    }
+    this.vulkanFallback ??= this.runVulkanFallback()
+    return this.vulkanFallback
+  }
+
+  private async runVulkanFallback(): Promise<boolean> {
+    const envs: Record<string, string> = {}
+    if (this.llamacpp_env) this.parseEnvFromString(envs, this.llamacpp_env)
+
+    let devices: DeviceList[]
+    try {
+      devices = await engineDevices(envs)
+    } catch (e) {
+      // A probe failure vetoes nothing -- the next arch error tries again.
+      this.vulkanFallback = undefined
+      logger.warn('Device probe failed during the Vulkan fallback:', e)
+      return false
+    }
+    if (!devices.some((d) => /^vulkan/i.test(d.id ?? ''))) return false
+
+    this.cudaHidden = true
+    this.enginePort = undefined
+    this.engineApiKey = undefined
+    try {
+      await stopEngine()
+      await this.startEngine()
+    } catch (e) {
+      logger.warn('Restarting the engine for the Vulkan fallback failed:', e)
+      return false
+    }
+    if (!(await this.getEngineInfo())) return false
+
+    logger.warn(
+      'The bundled CUDA backend has no kernel for this GPU architecture; the model is loading on Vulkan'
+    )
+    events.emit(AppEvent.onEngineBackendFallback, {
+      from: 'cuda',
+      to: 'vulkan',
+    })
+    return true
   }
 
   /**
@@ -2752,6 +2834,9 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
   async getDevices(): Promise<DeviceList[]> {
     // set envs
     const envs: Record<string, string> = {}
+    // Once CUDA has been hidden for the session, the device list must not keep
+    // advertising the GPUs the engine can no longer use.
+    if (this.cudaHidden) envs['CUDA_VISIBLE_DEVICES'] = ''
     if (this.llamacpp_env) this.parseEnvFromString(envs, this.llamacpp_env)
 
     try {

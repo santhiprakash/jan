@@ -85,6 +85,7 @@ import { ExtensionManager } from '@/lib/extension'
 import { Shimmer } from '@/components/ai-elements/shimmer'
 import { useMessageQueue } from '@/stores/message-queue-store'
 import { generateThreadTitle } from '@/lib/thread-title-summarizer'
+import { isGpuArchUnsupportedError } from '@/lib/engineError'
 import { useAutoScroll } from '@/hooks/useAutoScroll'
 
 const CHAT_STATUS = {
@@ -262,6 +263,7 @@ function ThreadDetail() {
   const isLlamacppActive = selectedProvider === 'llamacpp'
   const oomError = isLlamacppActive ? oomErrorRaw : undefined
   const backendError = isLlamacppActive ? backendErrorRaw : undefined
+  const backendArchError = isGpuArchUnsupportedError(backendError)
 
   const handleContextSizeIncreaseRef = useRef<(() => void) | null>(null)
   const setContinueFromContentRef = useRef<((content: string) => void) | null>(
@@ -1818,9 +1820,11 @@ function ThreadDetail() {
                       <p className="text-sm font-medium text-destructive mb-1">
                         {oomError
                           ? 'llama.cpp ran out of memory'
-                          : backendError
-                            ? 'GGML backend encountered an error'
-                            : 'Model ran out of context size'}
+                          : backendArchError
+                            ? 'GPU architecture not supported by the bundled CUDA backend'
+                            : backendError
+                              ? 'GGML backend encountered an error'
+                              : 'Model ran out of context size'}
                       </p>
                       <div className="table table-fixed w-full">
                         <span
