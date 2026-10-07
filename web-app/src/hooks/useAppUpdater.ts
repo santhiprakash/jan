@@ -12,6 +12,61 @@ export interface UpdateState {
   downloadedBytes: number
   totalBytes: number
   remindMeLater: boolean
+  error: string | null
+}
+
+export type UpdateErrorKind =
+  | 'signature'
+  | 'network'
+  | 'diskSpace'
+  | 'install'
+  | 'unknown'
+
+/**
+ * Best-effort mapping of a raw updater error message to a category the UI
+ * can show a translated summary for. The raw message stays available next to
+ * the summary, so a wrong bucket never hides what actually happened.
+ */
+export const getUpdateErrorKind = (message: string): UpdateErrorKind => {
+  const m = message.toLowerCase()
+  if (m.includes('signature') || m.includes('verif')) return 'signature'
+  if (
+    m.includes('space') ||
+    m.includes('enospc') ||
+    m.includes('quota') ||
+    m.includes('storage')
+  ) {
+    return 'diskSpace'
+  }
+  if (
+    m.includes('network') ||
+    m.includes('internet') ||
+    m.includes('offline') ||
+    m.includes('dns') ||
+    m.includes('timed out') ||
+    m.includes('timeout') ||
+    m.includes('connect') ||
+    m.includes('request') ||
+    m.includes('fetch') ||
+    m.includes('certificate') ||
+    m.includes('tls') ||
+    m.includes('ssl')
+  ) {
+    return 'network'
+  }
+  if (
+    m.includes('install') ||
+    m.includes('mount point') ||
+    m.includes('appimage') ||
+    m.includes('archive') ||
+    m.includes('temporary') ||
+    m.includes('permission denied') ||
+    m.includes('read-only') ||
+    m.includes('authentication')
+  ) {
+    return 'install'
+  }
+  return 'unknown'
 }
 
 export const useAppUpdater = () => {
@@ -23,6 +78,7 @@ export const useAppUpdater = () => {
     downloadedBytes: 0,
     totalBytes: 0,
     remindMeLater: false,
+    error: null,
   })
 
   // Listen for app update state sync events
@@ -81,6 +137,7 @@ export const useAppUpdater = () => {
               isUpdateAvailable: true,
               remindMeLater: false,
               updateInfo: update,
+              error: null,
             }
             setUpdateState((prev) => ({
               ...prev,
@@ -95,6 +152,7 @@ export const useAppUpdater = () => {
             const newState = {
               isUpdateAvailable: false,
               updateInfo: null,
+              error: null,
             }
             setUpdateState((prev) => ({
               ...prev,
@@ -108,6 +166,7 @@ export const useAppUpdater = () => {
           const newState = {
             isUpdateAvailable: false,
             updateInfo: null,
+            error: null,
             ...(resetRemindMeLater && { remindMeLater: false }),
           }
           setUpdateState((prev) => ({
@@ -124,6 +183,7 @@ export const useAppUpdater = () => {
         const newState = {
           isUpdateAvailable: false,
           updateInfo: null,
+          error: null,
         }
         setUpdateState((prev) => ({
           ...prev,
@@ -164,6 +224,7 @@ export const useAppUpdater = () => {
       setUpdateState((prev) => ({
         ...prev,
         isDownloading: true,
+        error: null,
       }))
 
       let downloaded = 0
@@ -209,34 +270,50 @@ export const useAppUpdater = () => {
           }
           case 'Finished':
             console.log('Download finished')
+            // The bundle is downloaded and verified at this point but the
+            // install is still running — keep isDownloading so the UI shows
+            // the install phase, and only report success once the whole
+            // download + install promise resolves.
             setUpdateState((prev) => ({
               ...prev,
-              isDownloading: false,
               downloadProgress: 1,
             }))
-
-            // Emit app update download success event
-            events.emit(AppEvent.onAppUpdateDownloadSuccess, {})
             break
         }
       })
 
-      await window.core?.api?.relaunch()
-
-      console.log('Update installed')
-    } catch (error) {
-      console.error('Error downloading update:', error)
+      // Downloaded, verified and installed — safe to report success now.
+      // Emitting on the plugin's `Finished` event instead would celebrate a
+      // download whose install can still fail.
+      events.emit(AppEvent.onAppUpdateDownloadSuccess, {})
       setUpdateState((prev) => ({
         ...prev,
         isDownloading: false,
       }))
 
+      await window.core?.api?.relaunch()
+
+      console.log('Update installed')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      console.error('Error downloading update:', error)
+      const newState = {
+        isDownloading: false,
+        error: message,
+      }
+      setUpdateState((prev) => ({
+        ...prev,
+        ...newState,
+      }))
+      // Sync to other instances
+      syncStateToOtherInstances(newState)
+
       // Emit app update download error event
       events.emit(AppEvent.onAppUpdateDownloadError, {
-        message: error instanceof Error ? error.message : 'Unknown error',
+        message,
       })
     }
-  }, [updateState.updateInfo])
+  }, [updateState.updateInfo, syncStateToOtherInstances])
 
 
   return {

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-import { useAppUpdater } from '../useAppUpdater'
+import { getUpdateErrorKind, useAppUpdater } from '../useAppUpdater'
 
 // Mock dependencies
 vi.mock('@/lib/utils', () => ({
@@ -92,6 +92,7 @@ describe('useAppUpdater', () => {
       downloadedBytes: 0,
       totalBytes: 0,
       remindMeLater: false,
+      error: null,
     })
   })
 
@@ -333,9 +334,99 @@ describe('useAppUpdater', () => {
         expect.any(Error)
       )
       expect(result.current.updateState.isDownloading).toBe(false)
+      // The failure must reach updateState so the dialog can render it — a
+      // popup that already closed has nowhere to show the event's toast.
+      expect(result.current.updateState.error).toBe('Download failed')
       expect(mockEvents.emit).toHaveBeenCalledWith('onAppUpdateDownloadError', {
         message: 'Download failed',
       })
+      expect(mockEvents.emit).toHaveBeenCalledWith('onAppUpdateStateSync', {
+        isDownloading: false,
+        error: 'Download failed',
+      })
+
+      consoleErrorSpy.mockRestore()
+    })
+
+    it('should not emit success on Finished before install resolves', async () => {
+      const mockUpdate = { version: '1.2.0', downloadAndInstall: vi.fn() }
+      mockUpdaterCheck.mockResolvedValue(mockUpdate)
+
+      const { result } = renderHook(() => useAppUpdater())
+
+      await act(async () => {
+        await result.current.checkForUpdate()
+      })
+
+      let resolveInstall: (() => void) | undefined
+      mockUpdaterDownloadAndInstallWithProgress.mockImplementation(
+        async (progressCallback) => {
+          progressCallback({ event: 'Started', data: { contentLength: 1000 } })
+          progressCallback({ event: 'Progress', data: { chunkLength: 1000 } })
+          // `Finished` only means the bundle is downloaded and verified; the
+          // promise stays pending while the install runs.
+          progressCallback({ event: 'Finished' })
+          await new Promise<void>((resolve) => {
+            resolveInstall = resolve
+          })
+        }
+      )
+
+      let downloadPromise!: Promise<void>
+      await act(async () => {
+        downloadPromise = result.current.downloadAndInstallUpdate()
+      })
+
+      expect(result.current.updateState.downloadProgress).toBe(1)
+      expect(result.current.updateState.isDownloading).toBe(true)
+      expect(mockEvents.emit).not.toHaveBeenCalledWith(
+        'onAppUpdateDownloadSuccess',
+        expect.anything()
+      )
+
+      await act(async () => {
+        resolveInstall?.()
+        await downloadPromise
+      })
+
+      expect(result.current.updateState.isDownloading).toBe(false)
+      expect(mockEvents.emit).toHaveBeenCalledWith(
+        'onAppUpdateDownloadSuccess',
+        {}
+      )
+    })
+
+    it('should clear a previous error when the update is retried', async () => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const mockUpdate = { version: '1.2.0', downloadAndInstall: vi.fn() }
+      mockUpdaterCheck.mockResolvedValue(mockUpdate)
+
+      const { result } = renderHook(() => useAppUpdater())
+
+      await act(async () => {
+        await result.current.checkForUpdate()
+      })
+
+      mockUpdaterDownloadAndInstallWithProgress.mockRejectedValueOnce(
+        new Error('The signature verification failed')
+      )
+
+      await act(async () => {
+        await result.current.downloadAndInstallUpdate()
+      })
+
+      expect(result.current.updateState.error).toBe(
+        'The signature verification failed'
+      )
+
+      mockUpdaterDownloadAndInstallWithProgress.mockResolvedValue(undefined)
+
+      await act(async () => {
+        await result.current.downloadAndInstallUpdate()
+      })
+
+      expect(result.current.updateState.error).toBe(null)
+      expect(result.current.updateState.isDownloading).toBe(false)
 
       consoleErrorSpy.mockRestore()
     })
@@ -396,6 +487,39 @@ describe('useAppUpdater', () => {
         totalBytes: 2000,
       })
       expect(mockEvents.emit).toHaveBeenCalledWith('onAppUpdateDownloadSuccess', {})
+    })
+  })
+
+  describe('getUpdateErrorKind', () => {
+    it('maps the real tauri-plugin-updater error strings', () => {
+      // minisign_verify::Error::InvalidSignature
+      expect(getUpdateErrorKind('The signature verification failed')).toBe(
+        'signature'
+      )
+      // reqwest::Error transparent passthrough
+      expect(
+        getUpdateErrorKind(
+          'error sending request for url (https://example.com/update.zip)'
+        )
+      ).toBe('network')
+      expect(
+        getUpdateErrorKind('error trying to connect: dns error')
+      ).toBe('network')
+      // std::io::Error transparent passthrough
+      expect(
+        getUpdateErrorKind('No space left on device (os error 28)')
+      ).toBe('diskSpace')
+      // installer-stage errors
+      expect(getUpdateErrorKind('Failed to install package')).toBe('install')
+      expect(
+        getUpdateErrorKind(
+          'temp directory is not on the same mount point as the AppImage'
+        )
+      ).toBe('install')
+      // anything unrecognized falls back to the generic message
+      expect(getUpdateErrorKind('something completely unexpected')).toBe(
+        'unknown'
+      )
     })
   })
 })

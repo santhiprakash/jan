@@ -520,8 +520,8 @@
       "description": "Message edited successfully. Please wait for the model to respond."
     },
     "appUpdateDownloaded": {
-      "title": "App Update Downloaded",
-      "description": "The app update has been downloaded successfully."
+      "title": "App Update Installed",
+      "description": "The update was verified and installed. Jan will now restart."
     },
     "appUpdateDownloadFailed": {
       "title": "App Update Download Failed",

@@ -6,5 +6,13 @@
   "hideReleaseNotes": "Hide Release Notes",
   "remindMeLater": "Remind Me Later",
   "downloading": "Downloading...",
-  "updateNow": "Update Now"
+  "installing": "Installing...",
+  "updateNow": "Update Now",
+  "updateFailed": "Update failed",
+  "retry": "Retry",
+  "errorSignature": "The update could not be verified. The downloaded file's signature did not match.",
+  "errorNetwork": "The update could not be downloaded. Check your internet connection and try again.",
+  "errorDiskSpace": "There is not enough disk space to download and install the update.",
+  "errorInstall": "The update was downloaded but could not be installed.",
+  "errorGeneric": "Something went wrong while updating Jan."
 }

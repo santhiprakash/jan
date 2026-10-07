@@ -74,15 +74,25 @@ export function DownloadManagement() {
     })
   }, [t])
 
-  const onAppUpdateDownloadError = useCallback(() => {
-    setAppUpdateState((prev) => ({
-      ...prev,
-      isDownloading: false,
-    }))
-    toast.error(t('common:toast.appUpdateDownloadFailed.title'), {
-      description: t('common:toast.appUpdateDownloadFailed.description'),
-    })
-  }, [t])
+  const onAppUpdateDownloadError = useCallback(
+    (data?: { message?: string }) => {
+      setAppUpdateState((prev) => ({
+        ...prev,
+        isDownloading: false,
+      }))
+      // The updater dialog renders the failure itself while it is open. Only
+      // toast when it cannot be seen (user dismissed it mid-download), and
+      // include the real error message rather than a bare "try again".
+      if (updateState.remindMeLater || !updateState.isUpdateAvailable) {
+        toast.error(t('common:toast.appUpdateDownloadFailed.title'), {
+          description:
+            data?.message ??
+            t('common:toast.appUpdateDownloadFailed.description'),
+        })
+      }
+    },
+    [t, updateState.remindMeLater, updateState.isUpdateAvailable]
+  )
 
   const downloadProcesses = useMemo(() => {
     // Get downloads with progress data

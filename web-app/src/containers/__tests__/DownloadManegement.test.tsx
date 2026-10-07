@@ -231,6 +231,44 @@ describe('DownloadManagement', () => {
     expect(hoisted.toastMock.error).toHaveBeenCalled()
   })
 
+  it('on app update download error, forwards the real message in the toast', () => {
+    render(<DownloadManagement />)
+    hoisted.eventHandlers['aude']({ message: 'The signature verification failed' })
+    expect(hoisted.toastMock.error).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        description: 'The signature verification failed',
+      })
+    )
+  })
+
+  it('does not toast an update error while the updater dialog can show it', () => {
+    // Popup visible (update available, not dismissed): the dialog renders the
+    // failure itself, so a second toast would be noise.
+    Object.assign(hoisted.updateState, {
+      isUpdateAvailable: true,
+      remindMeLater: false,
+    })
+    render(<DownloadManagement />)
+    hoisted.eventHandlers['aude']({ message: 'Download failed' })
+    expect(hoisted.toastMock.error).not.toHaveBeenCalled()
+  })
+
+  it('toasts an update error with the message when the dialog was dismissed', () => {
+    Object.assign(hoisted.updateState, {
+      isUpdateAvailable: true,
+      remindMeLater: true,
+    })
+    render(<DownloadManagement />)
+    hoisted.eventHandlers['aude']({ message: 'No space left on device (os error 28)' })
+    expect(hoisted.toastMock.error).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        description: 'No space left on device (os error 28)',
+      })
+    )
+  })
+
   it('pauses a model download and marks it paused', async () => {
     hoisted.downloadStore.downloads = {
       'cloud-model': {
