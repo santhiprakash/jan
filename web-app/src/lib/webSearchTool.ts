@@ -1,5 +1,10 @@
-import { webSearch, webFetch } from '@janhq/tauri-plugin-websearch-api'
+import {
+  webSearch,
+  webFetch,
+  ProxyConfig,
+} from '@janhq/tauri-plugin-websearch-api'
 import { useMCPServers } from '@/hooks/useMCPServers'
+import { useProxyConfig } from '@/hooks/useProxyConfig'
 import { useWebSearchConfig } from '@/hooks/useWebSearchConfig'
 import { TRUNCATION_MARKER } from '@/lib/toolPresentation'
 
@@ -60,6 +65,34 @@ function faviconFor(url: string): string | undefined {
 type WebToolInput = { query?: unknown; count?: unknown; url?: unknown }
 type WebToolResult = { content?: unknown; error?: string }
 
+// Jan's persisted proxy (Settings → Privacy → HTTPS Proxy) - the same fields
+// the download path forwards as jan_utils::network::ProxyConfig.
+const configuredProxy = (): ProxyConfig | undefined => {
+  const {
+    proxyEnabled,
+    proxyUrl,
+    proxyUsername,
+    proxyPassword,
+    proxyIgnoreSSL,
+    noProxy,
+  } = useProxyConfig.getState()
+  if (!proxyEnabled || !proxyUrl.trim()) return undefined
+  return {
+    url: proxyUrl.trim(),
+    ...(proxyUsername.trim() ? { username: proxyUsername.trim() } : {}),
+    ...(proxyPassword ? { password: proxyPassword } : {}),
+    ...(proxyIgnoreSSL ? { ignore_ssl: true } : {}),
+    ...(noProxy.trim()
+      ? {
+          no_proxy: noProxy
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean),
+        }
+      : {}),
+  }
+}
+
 /**
  * The most characters a built-in web result may put into the conversation.
  *
@@ -105,7 +138,14 @@ export async function executeWebTool(
     if (toolName === 'web_search') {
       const query = typeof input?.query === 'string' ? input.query : ''
       const count = typeof input?.count === 'number' ? input.count : undefined
-      const results = await webSearch(query, count, apiKey, searchProvider, endpoint)
+      const results = await webSearch(
+        query,
+        count,
+        apiKey,
+        searchProvider,
+        endpoint,
+        configuredProxy()
+      )
       return {
         content: {
           kind: 'web',
@@ -122,7 +162,13 @@ export async function executeWebTool(
     }
     if (toolName === 'web_fetch') {
       const url = typeof input?.url === 'string' ? input.url : ''
-      const page = await webFetch(url, apiKey, searchProvider, endpoint)
+      const page = await webFetch(
+        url,
+        apiKey,
+        searchProvider,
+        endpoint,
+        configuredProxy()
+      )
       const cap = webOutputCap(options.maxOutputChars)
       let title = page.title
       let address = page.url

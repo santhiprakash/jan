@@ -18,6 +18,7 @@
 //! output size so tool results can't blow up the model's context.
 
 use async_trait::async_trait;
+use jan_utils::network::{create_proxy_from_config, ProxyConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -161,23 +162,30 @@ impl WebSearchConfig {
             self.provider.as_deref(),
             self.api_key.clone(),
             self.endpoint.clone(),
+            // The agent/CLI hosts this config serves don't carry a proxy
+            // selection yet; plumbing one is a separate change.
+            None,
         )
     }
 }
 
 /// Build the backend for `provider` (case-insensitive; empty/absent selects the
 /// default). `api_key` is used by keyed backends; `endpoint` by self-hosted ones
-/// (e.g. a SearXNG instance URL).
+/// (e.g. a SearXNG instance URL). `proxy` carries the user's configured outbound
+/// proxy (Settings → Privacy → HTTPS Proxy); `None` keeps reqwest's defaults,
+/// which still honor proxy env vars and the OS system proxy.
 pub fn create_provider(
     provider: Option<&str>,
     api_key: Option<String>,
     endpoint: Option<String>,
+    proxy: Option<ProxyConfig>,
 ) -> Result<Box<dyn SearchProvider>, String> {
+    let proxy = proxy.as_ref();
     match provider.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        None | Some("") | Some("exa") => Ok(Box::new(ExaProvider::new(api_key)?)),
-        Some("tavily") => Ok(Box::new(TavilyProvider::new(api_key)?)),
-        Some("searxng") => Ok(Box::new(SearxngProvider::new(endpoint)?)),
-        Some("you") => Ok(Box::new(YouComProvider::new(api_key)?)),
+        None | Some("") | Some("exa") => Ok(Box::new(ExaProvider::new(api_key, proxy)?)),
+        Some("tavily") => Ok(Box::new(TavilyProvider::new(api_key, proxy)?)),
+        Some("searxng") => Ok(Box::new(SearxngProvider::new(endpoint, proxy)?)),
+        Some("you") => Ok(Box::new(YouComProvider::new(api_key, proxy)?)),
         Some(other) => Err(format!("Unknown web search provider '{other}'")),
     }
 }
@@ -186,9 +194,30 @@ fn require_key(provider: &str, api_key: Option<String>) -> Result<String, String
     normalize_key(api_key).ok_or_else(|| format!("{provider} requires an API key"))
 }
 
-fn build_http_client(provider: &str) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+fn build_http_client(
+    provider: &str,
+    proxy: Option<&ProxyConfig>,
+) -> Result<reqwest::Client, String> {
+    let mut builder =
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS));
+    if let Some(config) = proxy {
+        if config.ignore_ssl.unwrap_or(false) {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let mut upstream = create_proxy_from_config(config)
+            .map_err(|e| format!("failed to build HTTP client for {provider}: {e}"))?;
+        // `no_proxy` entries attach to the proxy matcher so they are evaluated
+        // per request - `web_fetch` targets arbitrary URLs, unlike a download
+        // client built for one known URL.
+        if let Some(entries) = config.no_proxy.as_deref() {
+            let joined = entries.join(",");
+            if !joined.is_empty() {
+                upstream = upstream.no_proxy(reqwest::NoProxy::from_string(&joined));
+            }
+        }
+        builder = builder.proxy(upstream);
+    }
+    builder
         .build()
         .map_err(|e| format!("failed to build HTTP client for {provider}: {e}"))
 }
@@ -219,15 +248,12 @@ pub struct ExaProvider {
 }
 
 impl ExaProvider {
-    pub fn new(api_key: Option<String>) -> Result<Self, String> {
+    pub fn new(api_key: Option<String>, proxy: Option<&ProxyConfig>) -> Result<Self, String> {
         let mode = match normalize_key(api_key) {
             Some(key) => ExaMode::Rest(key),
             None => ExaMode::Hosted,
         };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| format!("failed to build HTTP client for Exa: {e}"))?;
+        let client = build_http_client("Exa", proxy)?;
         Ok(Self { mode, client })
     }
 
@@ -575,10 +601,10 @@ pub struct TavilyProvider {
 }
 
 impl TavilyProvider {
-    pub fn new(api_key: Option<String>) -> Result<Self, String> {
+    pub fn new(api_key: Option<String>, proxy: Option<&ProxyConfig>) -> Result<Self, String> {
         Ok(Self {
             api_key: require_key("Tavily", api_key)?,
-            client: build_http_client("Tavily")?,
+            client: build_http_client("Tavily", proxy)?,
         })
     }
 
@@ -717,14 +743,14 @@ pub struct YouComProvider {
 }
 
 impl YouComProvider {
-    pub fn new(api_key: Option<String>) -> Result<Self, String> {
+    pub fn new(api_key: Option<String>, proxy: Option<&ProxyConfig>) -> Result<Self, String> {
         let mode = match normalize_key(api_key) {
             Some(key) => YouComMode::Rest(key),
             None => YouComMode::Hosted,
         };
         Ok(Self {
             mode,
-            client: build_http_client("You.com")?,
+            client: build_http_client("You.com", proxy)?,
         })
     }
 
@@ -1002,7 +1028,7 @@ pub struct SearxngProvider {
 }
 
 impl SearxngProvider {
-    pub fn new(endpoint: Option<String>) -> Result<Self, String> {
+    pub fn new(endpoint: Option<String>, proxy: Option<&ProxyConfig>) -> Result<Self, String> {
         let base = endpoint
             .map(|e| e.trim().trim_end_matches('/').to_string())
             .filter(|e| !e.is_empty())
@@ -1014,7 +1040,7 @@ impl SearxngProvider {
         }
         Ok(Self {
             base_url: base,
-            client: build_http_client("SearXNG")?,
+            client: build_http_client("SearXNG", proxy)?,
         })
     }
 }
@@ -1288,25 +1314,25 @@ mod tests {
 
     #[test]
     fn empty_key_selects_hosted() {
-        let p = ExaProvider::new(None).unwrap();
+        let p = ExaProvider::new(None, None).unwrap();
         assert_eq!(p.mode, ExaMode::Hosted);
-        let p = ExaProvider::new(Some("  ".into())).unwrap();
+        let p = ExaProvider::new(Some("  ".into()), None).unwrap();
         assert_eq!(p.mode, ExaMode::Hosted);
-        let p = ExaProvider::new(Some("YOUR_EXA_API_KEY_HERE".into())).unwrap();
+        let p = ExaProvider::new(Some("YOUR_EXA_API_KEY_HERE".into()), None).unwrap();
         assert_eq!(p.mode, ExaMode::Hosted);
     }
 
     #[test]
     fn real_key_selects_rest() {
-        let p = ExaProvider::new(Some("abc123".into())).unwrap();
+        let p = ExaProvider::new(Some("abc123".into()), None).unwrap();
         assert_eq!(p.mode, ExaMode::Rest("abc123".into()));
     }
 
     #[test]
     fn create_provider_defaults_to_exa() {
-        assert!(create_provider(None, None, None).is_ok());
-        assert!(create_provider(Some(""), None, None).is_ok());
-        assert!(create_provider(Some("Exa"), None, None).is_ok());
+        assert!(create_provider(None, None, None, None).is_ok());
+        assert!(create_provider(Some(""), None, None, None).is_ok());
+        assert!(create_provider(Some("Exa"), None, None, None).is_ok());
     }
 
     #[test]
@@ -1374,7 +1400,7 @@ mod tests {
             let key = (!meta.keyless).then(|| "k".to_string());
             let endpoint = meta.requires_endpoint.then(|| "https://x.example".to_string());
             assert!(
-                create_provider(Some(meta.id), key, endpoint).is_ok(),
+                create_provider(Some(meta.id), key, endpoint, None).is_ok(),
                 "{} must be accepted by create_provider",
                 meta.id
             );
@@ -1386,7 +1412,7 @@ mod tests {
 
     #[test]
     fn create_provider_rejects_unknown() {
-        match create_provider(Some("brave"), None, None) {
+        match create_provider(Some("brave"), None, None, None) {
             Ok(_) => panic!("expected unknown provider to error"),
             Err(e) => assert!(e.contains("brave")),
         }
@@ -1394,26 +1420,30 @@ mod tests {
 
     #[test]
     fn create_provider_tavily_requires_key() {
-        match create_provider(Some("tavily"), None, None) {
+        match create_provider(Some("tavily"), None, None, None) {
             Ok(_) => panic!("expected Tavily to require a key"),
             Err(e) => assert!(e.contains("Tavily")),
         }
-        assert!(create_provider(Some("tavily"), Some("tvly-abc".into()), None).is_ok());
+        assert!(create_provider(Some("tavily"), Some("tvly-abc".into()), None, None).is_ok());
     }
 
     #[test]
     fn create_provider_searxng_requires_valid_url() {
-        match create_provider(Some("searxng"), None, None) {
+        match create_provider(Some("searxng"), None, None, None) {
             Ok(_) => panic!("expected SearXNG to require an instance URL"),
             Err(e) => assert!(e.contains("SearXNG")),
         }
-        match create_provider(Some("searxng"), None, Some("example.com".into())) {
+        match create_provider(Some("searxng"), None, Some("example.com".into()), None) {
             Ok(_) => panic!("expected SearXNG to reject a scheme-less URL"),
             Err(e) => assert!(e.contains("http")),
         }
-        assert!(
-            create_provider(Some("searxng"), None, Some("https://searx.example/".into())).is_ok()
-        );
+        assert!(create_provider(
+            Some("searxng"),
+            None,
+            Some("https://searx.example/".into()),
+            None
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1676,7 +1706,7 @@ mod tests {
         // rejects with HTTP 415 ("Content-Type must be application/json").
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" });
         let req = with_youcom_headers(
-            YouComProvider::new(None)
+            YouComProvider::new(None, None)
                 .unwrap()
                 .client
                 .post(YOU_COM_HOSTED_URL)
@@ -1696,21 +1726,26 @@ mod tests {
 
     #[test]
     fn youcom_key_selects_transport() {
-        assert_eq!(YouComProvider::new(None).unwrap().mode, YouComMode::Hosted);
         assert_eq!(
-            YouComProvider::new(Some("   ".into())).unwrap().mode,
+            YouComProvider::new(None, None).unwrap().mode,
             YouComMode::Hosted
         );
         assert_eq!(
-            YouComProvider::new(Some("ydc-key".into())).unwrap().mode,
+            YouComProvider::new(Some("   ".into()), None).unwrap().mode,
+            YouComMode::Hosted
+        );
+        assert_eq!(
+            YouComProvider::new(Some("ydc-key".into()), None)
+                .unwrap()
+                .mode,
             YouComMode::Rest("ydc-key".into())
         );
     }
 
     #[test]
     fn create_provider_youcom_works_with_and_without_key() {
-        assert!(create_provider(Some("you"), None, None).is_ok());
-        assert!(create_provider(Some("you"), Some("ydc-key".into()), None).is_ok());
+        assert!(create_provider(Some("you"), None, None, None).is_ok());
+        assert!(create_provider(Some("you"), Some("ydc-key".into()), None, None).is_ok());
     }
 
     #[test]
@@ -1907,7 +1942,7 @@ mod tests {
     fn youcom_extract_request_shape() {
         // Built the way `send_raw` sends it.
         let req = with_youcom_headers(
-            YouComProvider::new(None)
+            YouComProvider::new(None, None)
                 .unwrap()
                 .extract_request("https://example.com"),
         )
@@ -2075,7 +2110,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn youcom_fetch_live_keyless() {
-        let page = YouComProvider::new(None)
+        let page = YouComProvider::new(None, None)
             .unwrap()
             .fetch("https://example.com")
             .await
@@ -2087,5 +2122,159 @@ mod tests {
             page.content
         );
         assert!(page.content.contains("documentation examples"));
+    }
+
+    fn test_proxy_config(url: String) -> ProxyConfig {
+        ProxyConfig {
+            url,
+            username: None,
+            password: None,
+            no_proxy: None,
+            ignore_ssl: None,
+        }
+    }
+
+    /// Spawn a one-shot TCP listener that records what the client sent it and
+    /// returns a canned 200. Returns (port, receiver-for-request-bytes).
+    fn recording_listener(respond: &'static [u8]) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            stream.write_all(respond).unwrap();
+        });
+        (port, rx)
+    }
+
+    #[tokio::test]
+    async fn client_uses_configured_http_proxy() {
+        // `.invalid` never resolves (RFC 2606): a 200 response is only possible
+        // if the request was handed to the proxy, which answers without
+        // resolving the target itself.
+        let (port, rx) = recording_listener(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+        let client = build_http_client(
+            "Exa",
+            Some(&test_proxy_config(format!("http://127.0.0.1:{port}"))),
+        )
+        .unwrap();
+        let resp = client
+            .get("http://does-not-resolve.invalid/")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let request = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("proxy never received the request");
+        // Plain-HTTP requests to a forward proxy use absolute-form targets.
+        assert!(
+            request.starts_with("GET http://does-not-resolve.invalid/"),
+            "expected absolute-form request via proxy, got: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_without_proxy_connects_directly() {
+        if std::env::var_os("HTTP_PROXY").is_some()
+            || std::env::var_os("http_proxy").is_some()
+            || std::env::var_os("ALL_PROXY").is_some()
+            || std::env::var_os("all_proxy").is_some()
+        {
+            // Environment proxies are honored by reqwest by design; this test
+            // pins down the no-explicit-proxy path, which an env proxy would
+            // legitimately intercept.
+            return;
+        }
+        // Same listener as above, but addressed as the origin server. A
+        // proxied client would send absolute-form (`GET http://host/`); a
+        // direct client sends origin-form (`GET /`).
+        let (port, rx) = recording_listener(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+        let client = build_http_client("Exa", None).unwrap();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let request = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("origin server never received the request");
+        assert!(
+            request.starts_with("GET / "),
+            "expected origin-form request without a proxy, got: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_uses_configured_socks5_proxy() {
+        use std::io::{Read, Write};
+        // Minimal SOCKS5 server: no-auth greeting, CONNECT request, success
+        // reply, then the tunneled HTTP request (origin-form, since the tunnel
+        // terminates at the target). The target is TEST-NET-1 - unroutable, so
+        // a 200 response proves the bytes went through the SOCKS tunnel.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut greeting = [0u8; 2];
+            s.read_exact(&mut greeting).unwrap();
+            let nmethods = greeting[1] as usize;
+            let mut methods = vec![0u8; nmethods];
+            s.read_exact(&mut methods).unwrap();
+            s.write_all(&[0x05, 0x00]).unwrap(); // no-auth chosen
+            let mut req = [0u8; 4];
+            s.read_exact(&mut req).unwrap();
+            assert_eq!(&req[..3], &[0x05, 0x01, 0x00]); // VER, CONNECT, RSV
+            let atyp = req[3];
+            let addr_len = match atyp {
+                0x01 => 4,
+                0x03 => {
+                    let mut len = [0u8; 1];
+                    s.read_exact(&mut len).unwrap();
+                    len[0] as usize
+                }
+                0x04 => 16,
+                _ => panic!("bad ATYP {atyp}"),
+            };
+            let mut addr = vec![0u8; addr_len + 2]; // addr + port
+            s.read_exact(&mut addr).unwrap();
+            // SOCKS5 success reply bound to 0.0.0.0:0.
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let client = build_http_client(
+            "Exa",
+            Some(&test_proxy_config(format!("socks5://127.0.0.1:{port}"))),
+        )
+        .unwrap();
+        let resp = client.get("http://192.0.2.1/").send().await.unwrap();
+        assert!(resp.status().is_success());
+        let request = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("SOCKS server never received the tunneled request");
+        assert!(
+            request.starts_with("GET / "),
+            "expected origin-form inside the SOCKS tunnel, got: {request}"
+        );
+    }
+
+    #[test]
+    fn build_http_client_rejects_unsupported_proxy_scheme() {
+        // `create_proxy_from_config` validates the scheme; an unsupported one
+        // surfaces as our client-build error naming the provider.
+        let err = build_http_client("Exa", Some(&test_proxy_config("ftp://x".into())))
+            .expect_err("ftp:// proxy must be rejected");
+        assert!(err.contains("Exa"), "error should name the provider: {err}");
     }
 }

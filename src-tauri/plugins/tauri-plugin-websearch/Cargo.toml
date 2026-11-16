@@ -18,13 +18,19 @@ tauri = ["dep:tauri"]
 
 [dependencies]
 async-trait = "0.1"
+jan-utils = { path = "../../utils" }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2.5.0", default-features = false, features = [], optional = true }
 thiserror = "2.0.12"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `socks` enables socks4/socks5 proxy URLs (configured or via *_PROXY env);
+# `system-proxy` lets reqwest read the OS-level proxy (macOS System
+# Configuration, Windows registry) in addition to *_PROXY env vars — both are
+# required for Web Search to honor proxies users already configured
+# (janhq/jan#8951).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks", "system-proxy"] }
 
 [build-dependencies]
 tauri-plugin = { version = "2.3.1", features = ["build"] }
